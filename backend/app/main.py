@@ -5,9 +5,15 @@ from pydantic import BaseModel
 from app import seed
 from app.db import connect
 from app.engines.rota import build_week_slots, swap_legal, apply_swap
+from app.modules.load_projection import router as loads_router
+from app.modules.rebalance_preview import router as preview_router
+from app.modules.rebalance_confirm import router as confirm_router
 
 app = FastAPI(title="Chorerota", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.include_router(loads_router)
+app.include_router(preview_router)
+app.include_router(confirm_router)
 
 @app.on_event("startup")
 def _startup(): seed.init_db()
@@ -63,6 +69,7 @@ def generate(week_id: int, body: GenBody = GenBody()):
     c = connect()
     week = c.execute("SELECT * FROM weeks WHERE id=?", (week_id,)).fetchone()
     if not week: c.close(); raise HTTPException(404, "week not found")
+    if week["status"] == "sealed": c.close(); raise HTTPException(400, "week_sealed")
     mids = [r["id"] for r in c.execute("SELECT id FROM members WHERE active=1 AND data_quality='clean' ORDER BY id")]
     tids = [r["id"] for r in c.execute("SELECT id FROM tasks WHERE data_quality='clean' AND weight>0 ORDER BY id")]
     slots = build_week_slots(mids, tids, days=body.days)
@@ -77,9 +84,23 @@ def generate(week_id: int, body: GenBody = GenBody()):
 class SwapBody(BaseModel):
     a_day: int; a_task: int; b_day: int; b_task: int; note: str = ""
 
+@app.post("/api/weeks/{week_id}/seal")
+def seal_week(week_id: int):
+    c = connect()
+    week = c.execute("SELECT * FROM weeks WHERE id=?", (week_id,)).fetchone()
+    if not week: c.close(); raise HTTPException(404, "week_not_found")
+    if week["status"] == "sealed": c.close(); raise HTTPException(400, "week_sealed")
+    if week["status"] != "ready": c.close(); raise HTTPException(400, "week_not_ready")
+    c.execute("UPDATE weeks SET status='sealed' WHERE id=?", (week_id,))
+    c.commit(); c.close()
+    return {"ok": True, "status": "sealed"}
+
 @app.post("/api/weeks/{week_id}/swaps")
 def request_swap(week_id: int, body: SwapBody):
     c = connect()
+    week = c.execute("SELECT * FROM weeks WHERE id=?", (week_id,)).fetchone()
+    if not week: c.close(); raise HTTPException(404, "week not found")
+    if week["status"] == "sealed": c.close(); raise HTTPException(400, "week_sealed")
     assigns = [dict(r) for r in c.execute("SELECT day,task_id,member_id FROM assignments WHERE week_id=?", (week_id,))]
     check = swap_legal(assigns, body.a_day, body.a_task, body.b_day, body.b_task)
     if not check["ok"]:
@@ -101,6 +122,9 @@ def confirm_swap(swap_id: int):
     if not sw: c.close(); raise HTTPException(404, "swap not found")
     if sw["status"] != "pending":
         c.close(); raise HTTPException(400, "not_pending")
+    week = c.execute("SELECT * FROM weeks WHERE id=?", (sw["week_id"],)).fetchone()
+    if week is not None and week["status"] == "sealed":
+        c.close(); raise HTTPException(400, "week_sealed")
     assigns = [dict(r) for r in c.execute(
         "SELECT id,day,task_id,member_id FROM assignments WHERE week_id=?", (sw["week_id"],))]
     slots = [{"day": a["day"], "task_id": a["task_id"], "member_id": a["member_id"]} for a in assigns]
