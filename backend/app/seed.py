@@ -20,6 +20,7 @@ def init_db():
             ("负权重任务", -1, "dirty"),
         ])
         c.execute("INSERT INTO weeks(label,status) VALUES ('第12周','draft')")
+        c.execute("INSERT INTO weeks(label,status) VALUES ('第11周','sealed')")
         c.execute("INSERT INTO settings(key,value) VALUES ('household','绿纸之家')")
         c.commit()
     c.close()

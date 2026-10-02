@@ -5,6 +5,9 @@ from pydantic import BaseModel
 from app import seed
 from app.db import connect
 from app.engines.rota import build_week_slots, swap_legal, apply_swap
+from app.engines.rebalance.loads import eligible_member_ids, weight_map, project_loads, load_range
+from app.engines.rebalance.preview import find_plan
+from app.engines.rebalance.confirm import validate_and_apply, PlanError
 
 app = FastAPI(title="Chorerota", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -113,6 +116,107 @@ def confirm_swap(swap_id: int):
     c.execute("UPDATE swap_requests SET status='confirmed' WHERE id=?", (swap_id,))
     c.commit(); c.close()
     return {"ok": True, "swap_id": swap_id}
+
+# ---- 负荷重平衡:成员负荷投影 / 预览 / 确认(三处共用 engines/rebalance 口径) ----
+
+def _board_context(c, week_id: int):
+    week = c.execute("SELECT * FROM weeks WHERE id=?", (week_id,)).fetchone()
+    if not week:
+        raise HTTPException(404, "week not found")
+    members = [dict(r) for r in c.execute("SELECT * FROM members")]
+    tasks = [dict(r) for r in c.execute("SELECT * FROM tasks")]
+    assigns = [dict(r) for r in c.execute(
+        "SELECT * FROM assignments WHERE week_id=? ORDER BY day,task_id", (week_id,))]
+    return week, members, tasks, assigns
+
+def _loads_payload(assigns, members, tasks):
+    mids = eligible_member_ids(members)
+    loads = project_loads(assigns, mids, weight_map(tasks))
+    names = {m["id"]: m["name"] for m in members}
+    return {
+        "loads": [{"member_id": mid, "name": names.get(mid, "?"), "load": loads[mid]} for mid in mids],
+        "range": load_range(loads),
+    }
+
+@app.get("/api/weeks/{week_id}/loads")
+def week_loads(week_id: int):
+    c = connect()
+    try:
+        week, members, tasks, assigns = _board_context(c, week_id)
+        return {"week_id": week_id, "status": week["status"], **_loads_payload(assigns, members, tasks)}
+    finally:
+        c.close()
+
+def _enrich_step(step, members, tasks, weights):
+    names = {m["id"]: m["name"] for m in members}
+    titles = {t["id"]: t["title"] for t in tasks}
+    s = dict(step)
+    if s["kind"] == "move":
+        s["task_title"] = titles.get(s["task_id"], "?")
+        s["weight"] = weights.get(s["task_id"], 0)
+        s["from_name"] = names.get(s["from_member_id"], "?")
+        s["to_name"] = names.get(s["to_member_id"], "?")
+    else:
+        s["a_task_title"] = titles.get(s["a_task"], "?")
+        s["b_task_title"] = titles.get(s["b_task"], "?")
+        s["a_name"] = names.get(s["a_member_id"], "?")
+        s["b_name"] = names.get(s["b_member_id"], "?")
+    return s
+
+@app.post("/api/weeks/{week_id}/rebalance/preview")
+def rebalance_preview(week_id: int):
+    c = connect()
+    try:
+        week, members, tasks, assigns = _board_context(c, week_id)
+        if week["status"] != "ready":
+            raise HTTPException(400, "week_not_ready")
+        mids = eligible_member_ids(members)
+        weights = weight_map(tasks)
+        plan, before, after = find_plan(assigns, mids, weights)
+        resp = {
+            "week_id": week_id,
+            "improved": bool(plan),
+            "before": _loads_payload(assigns, members, tasks),
+            "after": None,
+            "plan": [],
+            "message": "当前排布已无法通过局部换格降低极差",
+        }
+        if plan:
+            new_slots, _, _ = validate_and_apply(assigns, plan, mids, weights)
+            resp["after"] = _loads_payload(new_slots, members, tasks)
+            resp["plan"] = [_enrich_step(s, members, tasks, weights) for s in plan]
+            resp["message"] = f"共 {len(plan)} 步局部换格,极差严格下降 {before} → {after}"
+        return resp
+    finally:
+        c.close()
+
+class RebalanceBody(BaseModel):
+    plan: list[dict] = []
+
+@app.post("/api/weeks/{week_id}/rebalance/confirm")
+def rebalance_confirm(week_id: int, body: RebalanceBody):
+    c = connect()
+    try:
+        week, members, tasks, assigns = _board_context(c, week_id)
+        if week["status"] != "ready":
+            raise HTTPException(400, "week_not_ready")
+        mids = eligible_member_ids(members)
+        weights = weight_map(tasks)
+        try:
+            new_slots, before, after = validate_and_apply(assigns, body.plan, mids, weights)
+        except PlanError as e:
+            raise HTTPException(400, e.reason)
+        by_key = {(a["day"], a["task_id"]): a for a in assigns}
+        changed = 0
+        for s in new_slots:
+            row = by_key[(s["day"], s["task_id"])]
+            if row["member_id"] != s["member_id"]:
+                c.execute("UPDATE assignments SET member_id=? WHERE id=?", (s["member_id"], row["id"]))
+                changed += 1
+        c.commit()
+        return {"ok": True, "before_range": before, "after_range": after, "changed_cells": changed}
+    finally:
+        c.close()
 
 @app.get("/api/settings")
 def get_settings():
